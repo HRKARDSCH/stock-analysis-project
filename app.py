@@ -110,10 +110,21 @@ if not watchlist_df.empty:
             args=(saved_ticker,),
         )
 
-run_analysis = st.sidebar.button("Fetch & Analyze Data", type="primary")
+run_analysis_clicked = st.sidebar.button("Fetch & Analyze Data", type="primary")
+
+# This session_state flag is the actual fix for the Buy/Sell button bug:
+# without it, clicking "Buy Now" or "Sell Now" inside the tabs causes a
+# rerun, and on that rerun the "Fetch & Analyze Data" button is no longer
+# freshly clicked - so the whole analysis section would disappear. By
+# storing "we should show analysis" in session_state, it survives reruns
+# triggered by other buttons on the page.
+if "analysis_active" not in st.session_state:
+    st.session_state.analysis_active = False
+if run_analysis_clicked:
+    st.session_state.analysis_active = True
 
 # ---------- MAIN LOGIC ----------
-if run_analysis:
+if st.session_state.analysis_active:
     with st.spinner("Fetching market data, running ML model and sentiment analysis..."):
 
         data, err = data_fetch.fetch_stock_data(ticker, period, interval)
@@ -285,6 +296,74 @@ if run_analysis:
                     "Net Profit / Loss": f"₹{pnl:,.2f}",
                 })
 
+                st.write("---")
+                st.subheader("💰 Trade Simulator — Real Buy / Sell, Tied to the Signal")
+                st.caption(
+                    "Unlike the calculator above (which is a hypothetical 'what if I bought "
+                    "at X' number), this section records an ACTUAL timestamped trade: click "
+                    "Buy Now to enter at today's live price, and Sell Now later (once the "
+                    "signal changes, or whenever you choose) to see the realized profit."
+                )
+
+                current_sma_signal = "BUY" if data["SMA_20"].iloc[-1] > data["SMA_50"].iloc[-1] else "SELL"
+                open_position = db.get_open_trade(ticker)
+
+                if open_position is None:
+                    st.info(f"No open position for {ticker.upper()}. Current signal: **{current_sma_signal}**")
+                    st.caption(
+                        "Choose Buy (Long) if you think price will go UP, or Sell (Short) "
+                        "if you think price will go DOWN — pick whichever matches the "
+                        "signal (or goes against it, your choice, like real trading)."
+                    )
+                    trade_shares = st.number_input("Shares", min_value=1, value=10, key="trade_shares")
+
+                    bcol1, bcol2 = st.columns(2)
+                    with bcol1:
+                        if st.button(f"🟢 Buy Now (Long) at ₹{current_price:.2f}"):
+                            db.open_trade(ticker, trade_shares, current_price, current_sma_signal, direction="LONG")
+                            st.rerun()
+                    with bcol2:
+                        if st.button(f"🔴 Sell Now (Short) at ₹{current_price:.2f}"):
+                            db.open_trade(ticker, trade_shares, current_price, current_sma_signal, direction="SHORT")
+                            st.rerun()
+                else:
+                    direction = open_position["direction"]
+                    entry_price = open_position["entry_price"]
+                    entry_shares = open_position["shares"]
+
+                    if direction == "SHORT":
+                        unrealized_pnl = (entry_price - current_price) * entry_shares
+                    else:
+                        unrealized_pnl = (current_price - entry_price) * entry_shares
+                    unrealized_pct = (unrealized_pnl / (entry_price * entry_shares) * 100) if entry_price > 0 else 0
+
+                    direction_label = "LONG (bought first)" if direction == "LONG" else "SHORT (sold first)"
+                    st.success(
+                        f"Open **{direction_label}** position: **{entry_shares} shares** at "
+                        f"**₹{entry_price:.2f}** on {open_position['entry_time']} "
+                        f"(signal was **{open_position['entry_signal']}** at the time)"
+                    )
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Entry Price", f"₹{entry_price:.2f}")
+                    c2.metric("Current Price", f"₹{current_price:.2f}")
+                    c3.metric("Unrealized P&L", f"₹{unrealized_pnl:,.2f}", f"{unrealized_pct:+.2f}%")
+
+                    st.write(f"Current signal: **{current_sma_signal}**")
+                    close_label = "🔴 Sell Now (Close Long)" if direction == "LONG" else "🟢 Buy Now (Cover Short)"
+                    if st.button(f"{close_label} at ₹{current_price:.2f}"):
+                        profit, profit_pct = db.close_trade(open_position["id"], current_price)
+                        if profit >= 0:
+                            st.success(f"Trade closed! Realized profit: ₹{profit:,.2f} ({profit_pct:+.2f}%)")
+                        else:
+                            st.error(f"Trade closed. Realized loss: ₹{profit:,.2f} ({profit_pct:+.2f}%)")
+                        st.rerun()
+
+                trade_history = db.get_trade_history(ticker)
+                if not trade_history.empty:
+                    st.write("---")
+                    st.write("**Trade History (this ticker):**")
+                    st.dataframe(trade_history, use_container_width=True, hide_index=True)
+
             # --- TAB 3: ML Predictor ---
             with tab3:
                 st.subheader("Machine Learning Trend Predictor")
@@ -415,32 +494,37 @@ if run_analysis:
 
                 if not bull_points.empty:
                     fig_candle.add_trace(go.Scatter(
-                        x=bull_points.index, y=bull_points["Low"] * 0.995,
+                        x=bull_points.index, y=bull_points["Low"] * 0.998,
                         mode="markers", name="Bullish Signal",
-                        marker=dict(symbol="triangle-up", color="lime", size=10)
+                        marker=dict(symbol="triangle-up", color="lime", size=12,
+                                    line=dict(color="white", width=1))
                     ))
                 if not bear_points.empty:
                     fig_candle.add_trace(go.Scatter(
-                        x=bear_points.index, y=bear_points["High"] * 1.005,
+                        x=bear_points.index, y=bear_points["High"] * 1.002,
                         mode="markers", name="Bearish Signal",
-                        marker=dict(symbol="triangle-down", color="red", size=10)
+                        marker=dict(symbol="triangle-down", color="red", size=12,
+                                    line=dict(color="white", width=1))
                     ))
 
                 # BUY/SELL + TP/SL boxes, similar style to TradingView labels
+                # (shorter arrows now, so it's clear exactly which candle each signal belongs to)
                 for idx, row in bull_points.iterrows():
                     fig_candle.add_annotation(
-                        x=idx, y=row["Low"] * 0.99,
+                        x=idx, y=row["Low"],
                         text=f"<b>BUY</b><br>TP: {row['Signal_TP']}<br>SL: {row['Signal_SL']}",
-                        showarrow=True, arrowhead=2, arrowcolor="lime", ax=0, ay=40,
-                        bgcolor="rgba(0,60,0,0.85)", bordercolor="lime", borderwidth=1,
+                        showarrow=True, arrowhead=3, arrowsize=1, arrowwidth=2,
+                        arrowcolor="lime", ax=0, ay=25, yanchor="top",
+                        bgcolor="rgba(0,60,0,0.9)", bordercolor="lime", borderwidth=1,
                         font=dict(color="white", size=10), align="left"
                     )
                 for idx, row in bear_points.iterrows():
                     fig_candle.add_annotation(
-                        x=idx, y=row["High"] * 1.01,
+                        x=idx, y=row["High"],
                         text=f"<b>SELL</b><br>TP: {row['Signal_TP']}<br>SL: {row['Signal_SL']}",
-                        showarrow=True, arrowhead=2, arrowcolor="red", ax=0, ay=-40,
-                        bgcolor="rgba(60,0,0,0.85)", bordercolor="red", borderwidth=1,
+                        showarrow=True, arrowhead=3, arrowsize=1, arrowwidth=2,
+                        arrowcolor="red", ax=0, ay=-25, yanchor="bottom",
+                        bgcolor="rgba(60,0,0,0.9)", bordercolor="red", borderwidth=1,
                         font=dict(color="white", size=10), align="left"
                     )
 
