@@ -8,10 +8,11 @@ Why SQLite?
 - Built into Python (the 'sqlite3' module is part of the standard library)
 - Creates a single file (stock_app.db) automatically the first time you run the app
 
-This file stores 3 things:
+This file stores 4 things:
 1. watchlist        -> tickers the user has saved to track
 2. portfolio_history -> a snapshot of portfolio value every time analysis is run
 3. predictions       -> every ML prediction made, so accuracy can be checked later
+4. trades            -> real Buy/Sell (Long/Short) actions, tied to the signal
 """
 
 import sqlite3
@@ -65,6 +66,23 @@ def init_db():
             predicted_price REAL NOT NULL,
             r2_score REAL,
             predicted_on TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            direction TEXT NOT NULL DEFAULT 'LONG',
+            shares REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            entry_time TEXT NOT NULL,
+            entry_signal TEXT,
+            exit_price REAL,
+            exit_time TEXT,
+            profit REAL,
+            profit_pct REAL,
+            status TEXT NOT NULL DEFAULT 'OPEN'
         )
     """)
 
@@ -162,6 +180,97 @@ def get_predictions(ticker: str):
     conn = get_connection()
     df = pd.read_sql_query(
         "SELECT * FROM predictions WHERE ticker = ? ORDER BY id DESC",
+        conn, params=(ticker.upper(),)
+    )
+    conn.close()
+    return df
+
+
+# ---------- TRADE SIMULATOR FUNCTIONS (real Buy/Sell, tied to signals) ----------
+
+def get_open_trade(ticker: str):
+    """
+    Returns the currently OPEN trade for this ticker, if any (as a dict), else None.
+    Only one open trade per ticker is allowed at a time - you must exit before
+    you can enter a new position for the same ticker.
+    """
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT * FROM trades WHERE ticker = ? AND status = 'OPEN' ORDER BY id DESC LIMIT 1",
+        conn, params=(ticker.upper(),)
+    )
+    conn.close()
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+
+def open_trade(ticker, shares, entry_price, entry_signal, direction="LONG"):
+    """
+    Records an entry action.
+    - direction="LONG": a normal Buy - profits if price goes UP later
+    - direction="SHORT": a short-sell - profits if price goes DOWN later
+      (you're borrowing shares to sell now, planning to buy them back cheaper)
+
+    `entry_signal` stores what the signal said at the moment of entry
+    (e.g. "BUY" or "SELL") - so later you can honestly show whether the
+    trade was taken WITH or AGAINST the signal.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO trades (ticker, direction, shares, entry_price, entry_time, entry_signal, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'OPEN')
+    """, (
+        ticker.upper(), direction, shares, entry_price,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), entry_signal,
+    ))
+    conn.commit()
+    conn.close()
+
+
+def close_trade(trade_id, exit_price):
+    """
+    Records an exit action: closes an open trade at the current market price,
+    calculating realized profit/loss for that specific trade.
+
+    LONG trades profit when exit_price > entry_price (sell higher than you bought).
+    SHORT trades profit when exit_price < entry_price (buy back cheaper than you sold).
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT shares, entry_price, direction FROM trades WHERE id = ?", (trade_id,))
+    shares, entry_price, direction = cursor.fetchone()
+
+    if direction == "SHORT":
+        # Sold high first, buying back now - profit if price fell
+        profit = (entry_price - exit_price) * shares
+    else:
+        # Bought first, selling now - profit if price rose
+        profit = (exit_price - entry_price) * shares
+
+    investment = entry_price * shares
+    profit_pct = (profit / investment * 100) if investment > 0 else 0.0
+
+    cursor.execute("""
+        UPDATE trades
+        SET exit_price = ?, exit_time = ?, profit = ?, profit_pct = ?, status = 'CLOSED'
+        WHERE id = ?
+    """, (
+        exit_price, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        profit, profit_pct, trade_id,
+    ))
+    conn.commit()
+    conn.close()
+    return profit, profit_pct
+
+
+def get_trade_history(ticker: str):
+    """Returns all trades (open and closed) for this ticker, newest first."""
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT * FROM trades WHERE ticker = ? ORDER BY id DESC",
         conn, params=(ticker.upper(),)
     )
     conn.close()
